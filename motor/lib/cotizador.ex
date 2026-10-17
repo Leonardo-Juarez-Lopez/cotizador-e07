@@ -27,7 +27,8 @@ defmodule Cotizador do
 
       # 7. Exceso de peso (excepto sobredimensionada con permiso)
       envio.peso_kg > reglas.peso_maximo_kg and
-          not (envio.tipo == :sobredimensionada and not is_nil(envio.permiso) and envio.permiso != "") ->
+          not (envio.tipo == :sobredimensionada and not is_nil(envio.permiso) and
+                   envio.permiso != "") ->
         {:error, :excede_peso_maximo}
 
       true ->
