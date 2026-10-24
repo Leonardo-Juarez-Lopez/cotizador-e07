@@ -1,144 +1,116 @@
 defmodule Cotizador do
-  def cotizar(envio, reglas) do
-    cond do
-      # 1. Validación de peso inválido
-      envio.peso_kg <= 0 ->
-        {:error, :peso_invalido}
+  @moduledoc """
+  Motor del cotizador: cálculo puro, sin estado mutable.
+  Las reglas de la variante llegan como argumento; aquí no hay números de E07.
+  """
 
-      # 2. Validación de distancia negativa
-      envio.distancia_km < 0 ->
-        {:error, :distancia_invalida}
+  @tipos [:general, :refrigerada, :peligrosa, :sobredimensionada]
 
-      # 3. Tipo de carga no registrada en las reglas
-      not Map.has_key?(reglas.recargo, envio.tipo) ->
-        {:error, :tipo_desconocido}
-
-      # 4. Puente no registrado en las reglas
-      envio.puente != nil and not Map.has_key?(reglas.cuota_puente, envio.puente) ->
-        {:error, :puente_desconocido}
-
-      # 5. Carga peligrosa sin número UN
-      envio.tipo == :peligrosa and (is_nil(envio.numero_un) or envio.numero_un == "") ->
-        {:error, :falta_numero_un}
-
-      # 6. Sobredimensionada sin permiso
-      envio.tipo == :sobredimensionada and (is_nil(envio.permiso) or envio.permiso == "") ->
-        {:error, :falta_permiso}
-
-      # 7. Exceso de peso (excepto sobredimensionada con permiso)
-      envio.peso_kg > reglas.peso_maximo_kg and
-          not (envio.tipo == :sobredimensionada and not is_nil(envio.permiso) and
-                   envio.permiso != "") ->
-        {:error, :excede_peso_maximo}
-
-      true ->
-        calcular_cotizacion(envio, reglas)
+  # Validar, y solo si pasa, calcular.
+  def cotizar(embarque, reglas) do
+    with :ok <- validar(embarque, reglas) do
+      {:ok, calcular(embarque, reglas)}
     end
   end
 
-  defp calcular_cotizacion(envio, reglas) do
-    # 1. Flete bruto por distancia
-    flete_bruto = envio.distancia_km * reglas.tarifa_km
+  # ── Validación: una cláusula por motivo, en el orden del enunciado ──
 
-    # 2. Cuota de puente
-    monto_puente =
-      if envio.puente do
-        Map.get(reglas.cuota_puente, envio.puente, 0)
-      else
-        0
-      end
+  defp validar(%{peso_kg: p}, _reglas) when p <= 0, do: {:error, :peso_invalido}
+  defp validar(%{distancia_km: d}, _reglas) when d <= 0, do: {:error, :distancia_invalida}
+  defp validar(%{tipo: t}, _reglas) when t not in @tipos, do: {:error, :tipo_desconocido}
 
-    subtotal = flete_bruto + monto_puente
+  defp validar(%{puente: p}, %{cuota_puente: cuotas}) when not is_map_key(cuotas, p),
+    do: {:error, :puente_desconocido}
 
-    # 3. Descuento por volumen (se calcula sobre el flete bruto)
-    desc_config = reglas.descuento
+  defp validar(%{tipo: :peligrosa, numero_un: un}, _reglas) when un in [nil, ""],
+    do: {:error, :falta_numero_un}
 
-    aplica_descuento =
-      case desc_config.criterio do
-        :a_partir_de -> envio.peso_kg >= desc_config.umbral_kg
-        :mayor_a -> envio.peso_kg > desc_config.umbral_kg
-        _ -> false
-      end
+  defp validar(%{tipo: :sobredimensionada, permiso: p}, _reglas) when p in [nil, ""],
+    do: {:error, :falta_permiso}
 
-    monto_descuento =
-      if aplica_descuento do
-        round(flete_bruto * desc_config.pct / 100)
-      else
-        0
-      end
+  # La sobredimensionada (con permiso) no tiene peso máximo: va antes de esa cláusula.
+  defp validar(%{tipo: :sobredimensionada}, _reglas), do: :ok
 
-    flete_neto = flete_bruto - monto_descuento
-    subtotal_neto = subtotal - monto_descuento
+  defp validar(%{peso_kg: p}, %{peso_maximo_kg: max}) when p > max,
+    do: {:error, :excede_peso_maximo}
 
-    # 4. Recargos por tipo de carga (calculados sobre la base con descuento)
-    recargo_config = Map.get(reglas.recargo, envio.tipo, %{pct: 0, fija: 0})
+  defp validar(_embarque, _reglas), do: :ok
 
-    base_recargo =
-      case Map.get(reglas, :base_recargo, :subtotal) do
-        :subtotal -> subtotal_neto
-        _ -> flete_neto
-      end
+  # ── Cálculo ──
 
-    monto_recargo = round(base_recargo * recargo_config.pct / 100) + recargo_config.fija
-
-    # 5. Cálculo final y ajuste por tarifa mínima
-    monto_calculado = subtotal_neto + monto_recargo
-
-    minimo = Map.get(reglas, :minimo, 0)
-
-    {ajuste_minimo, total_final} =
-      if monto_calculado < minimo do
-        {minimo - monto_calculado, minimo}
-      else
-        {0, monto_calculado}
-      end
-
-    resultado = %{
-      flete_bruto: flete_bruto,
-      flete: flete_neto,
-      puente: monto_puente,
-      cuota_puente: monto_puente,
-      subtotal: subtotal,
-      recargo: monto_recargo,
-      descuento: monto_descuento,
-      ajuste_minimo: ajuste_minimo,
-      total: total_final
-    }
-
-    {:ok, resultado}
-  end
-
-  # Resumen para lotes de cotizaciones
-  def resumen(lote, reglas) do
-    results = Enum.map(lote, fn envio -> {envio, cotizar(envio, reglas)} end)
-
-    {exitos, fallos} = Enum.split_with(results, fn {_, res} -> match?({:ok, _}, res) end)
-
-    cotizaciones = Enum.map(exitos, fn {_, {:ok, c}} -> c end)
-    rechazados = Enum.map(fallos, fn {e, {:error, motivo}} -> {e.id, motivo} end)
-
-    monto_total = Enum.reduce(cotizaciones, 0, fn c, acc -> acc + c.total end)
-
-    por_puente =
-      Enum.reduce(exitos, %{}, fn {envio, {:ok, cotizacion}}, acc ->
-        if envio.puente do
-          Map.update(acc, envio.puente, cotizacion.total, &(&1 + cotizacion.total))
-        else
-          acc
-        end
-      end)
+  defp calcular(e, r) do
+    flete_bruto = e.distancia_km * r.tarifa_km
+    descuento = descuento(e.peso_kg, r.descuento, flete_bruto)
+    flete = flete_bruto - descuento
+    cuota = Map.fetch!(r.cuota_puente, e.puente)
+    %{pct: pct_recargo, fija: fija} = Map.fetch!(r.recargo, e.tipo)
+    recargo = pct(base_recargo(r.base_recargo, flete, cuota), pct_recargo) + fija
+    subtotal = flete + cuota + recargo
+    total = max(subtotal, r.minimo)
 
     %{
-      total: monto_total,
-      monto_total: monto_total,
-      cotizados: length(cotizaciones),
-      aceptados: cotizaciones,
-      cotizaciones: cotizaciones,
-      rechazados: rechazados,
-      errores: rechazados,
-      por_puente: por_puente,
-      cantidad_aceptados: length(cotizaciones),
-      cantidad_rechazados: length(rechazados)
+      id: e.id,
+      flete_bruto: flete_bruto,
+      descuento: descuento,
+      flete: flete,
+      cuota_puente: cuota,
+      recargo: recargo,
+      ajuste_minimo: total - subtotal,
+      total: total
     }
   end
+
+  # El criterio del descuento se decide con cláusulas, no con if.
+  defp descuento(peso, %{criterio: :a_partir_de, umbral_kg: u, pct: p}, monto) when peso >= u,
+    do: pct(monto, p)
+
+  defp descuento(peso, %{criterio: :mas_de, umbral_kg: u, pct: p}, monto) when peso > u,
+    do: pct(monto, p)
+
+  defp descuento(_peso, _descuento, _monto), do: 0
+
+  # La base del recargo: solo el flete, o flete + cuota (subtotal).
+  defp base_recargo(:flete, flete, _cuota), do: flete
+  defp base_recargo(:subtotal, flete, cuota), do: flete + cuota
+
+  # Un porcentaje, redondeado al centavo, las mitades hacia arriba. Solo enteros.
+  defp pct(monto, p), do: div(monto * p + 50, 100)
+
+  # ── Resumen de un lote: Enum y |> ──
+
+  def resumen(embarques, reglas) do
+    inicial = %{
+      cotizaciones: [],
+      rechazados: [],
+      por_puente: Map.new(reglas.cuota_puente, fn {puente, _cuota} -> {puente, 0} end)
+    }
+
+    acumulado =
+      embarques
+      |> Enum.map(fn e -> {e, cotizar(e, reglas)} end)
+      |> Enum.reduce(inicial, &acumular/2)
+
+    %{
+      cotizados: length(acumulado.cotizaciones),
+      rechazados: Enum.reverse(acumulado.rechazados),
+      total: sumar_totales(acumulado.cotizaciones),
+      por_puente: acumulado.por_puente
+    }
+  end
+
+  defp acumular({e, {:ok, c}}, acc) do
+    %{
+      acc
+      | cotizaciones: [c | acc.cotizaciones],
+        por_puente: Map.update!(acc.por_puente, e.puente, &(&1 + c.total))
+    }
+  end
+
+  defp acumular({e, {:error, motivo}}, acc) do
+    %{acc | rechazados: [{e.id, motivo} | acc.rechazados]}
+  end
+
+  # Recursiva a mano, sin Enum: lista vacía suma 0; si no, la cabeza más la suma del resto.
+  defp sumar_totales([]), do: 0
+  defp sumar_totales([c | resto]), do: c.total + sumar_totales(resto)
 end
